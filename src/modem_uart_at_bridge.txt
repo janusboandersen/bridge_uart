@@ -1,0 +1,198 @@
+/**
+ * Implement the UART AT bridge as two FreeRTOS tasks.
+ * 
+ * The JTAG-SWD UART part is implemented via the USB CDC.
+ * 
+ * Janus, August 2025.
+ */
+
+#include <string.h>
+#include "esp_log.h"
+#include "esp_check.h"
+#include "driver/usb_serial_jtag.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "modem_uart_at_bridge.h"
+
+// Initialize UART channel for modem
+esp_err_t bridge_modem_uart_init(void)
+{
+    uart_config_t uart_cfg = {
+        .baud_rate      = BRIDGE_MODEM_BAUD,
+        .data_bits      = UART_DATA_8_BITS,
+        .parity         = UART_PARITY_DISABLE,
+        .stop_bits      = UART_STOP_BITS_1,
+        .flow_ctrl      = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk     = UART_SCLK_DEFAULT
+    };
+
+    // Install UART driver with memory allocation
+    ESP_ERROR_CHECK(
+    uart_driver_install(
+        BRIDGE_MODEM_UART,              // UART device
+        2*BRIDGE_UART_BUFFER_SIZE,      // Rx buffer
+        2*BRIDGE_UART_BUFFER_SIZE,      // Tx buffer
+        0,                              // Queue size
+        NULL,                           // Queue handle
+        0                               // Interrupt flags
+    ));
+    ESP_LOGI("usb_serial_jtag echo", "UART init done");
+
+    usb_serial_jtag_driver_config_t jtag_cfg = {
+        .rx_buffer_size     = BRIDGE_UART_BUFFER_SIZE,
+        .tx_buffer_size     = BRIDGE_UART_BUFFER_SIZE
+    };
+
+    // Install serial JTAG driver
+    ESP_ERROR_CHECK(
+    usb_serial_jtag_driver_install(&jtag_cfg));
+    ESP_LOGI("usb_serial_jtag echo", "USB_SERIAL_JTAG init done");
+
+    // Configure UART
+    ESP_ERROR_CHECK(
+    uart_param_config(
+        BRIDGE_MODEM_UART, 
+        &uart_cfg
+    ));
+
+    // Configure pinmux for Tx Rx
+    ESP_ERROR_CHECK(
+    uart_set_pin(
+        BRIDGE_MODEM_UART,
+        BRIDGE_MODEM_UART_TX_PIN,
+        BRIDGE_MODEM_UART_RX_PIN, 
+        BRIDGE_MODEM_UART_RTS_PIN,      // Not used
+        BRIDGE_MODEM_UART_CTS_PIN       // Not used
+    ));
+
+    return ESP_OK;
+}
+
+// Maintains line state, fills up waiting for line ending.
+// If line ending is not reached before buffer is full,
+// then partial buffer should flag that it's ready to send
+typedef struct {
+    bool is_ready;
+    size_t write_pos;
+    size_t MAX_POS;     //  = BRIDGE_UART_BUFFER_SIZE - 1
+    uint8_t line[BRIDGE_UART_BUFFER_SIZE];
+} linebuf_t;
+
+// init the linebuf
+linebuf_t linebuf = {
+    .is_ready = false,
+    .write_pos = 0,
+    .MAX_POS = BRIDGE_UART_BUFFER_SIZE - 1
+};
+
+void reset_linebuf() {
+    linebuf.is_ready = false;
+    linebuf.write_pos = 0;
+}
+
+
+// returns number of consumed characters from buffer
+size_t extract_line(uint8_t *rawbuf, size_t rem_rawbuf_len)
+{
+    bool eol_flag = false;
+    size_t read_pos;
+
+    // Process raw buffer up until reaching CR, LF, CRLF or end of buffer.
+    for (read_pos = 0; read_pos < rem_rawbuf_len; read_pos++) {
+        
+        uint8_t c = rawbuf[read_pos];
+
+        // EOL, raise eol_flag but continue processing to discard any subsequent EOL characters.
+        if (c == '\r' || c == '\n') {
+            eol_flag = true;
+            continue; // discard remaining EOL characters
+        }
+
+        if (eol_flag) break;  // end loop
+
+        // No EOL yet
+        if (!eol_flag) {
+            switch (c) {
+                case 0x08:  // backspace
+                case 0x7F:  // del
+                    if (linebuf.write_pos > 0) linebuf.write_pos--;
+                    break;
+                case 0x15:  // Ctrl-U kill line
+                    reset_linebuf();
+                    return read_pos + 1; // consume the character
+                    break;
+                default:    // other chars, write to buffer
+                    if (linebuf.write_pos <= linebuf.MAX_POS) {
+                        linebuf.line[linebuf.write_pos++] = c;
+                    } else {
+                        // no more capacity
+                        linebuf.is_ready = true;
+                        return read_pos;            // don't consume the current char
+                    }
+                        
+            }
+        } 
+    } // for...
+
+    // EOL asserted, linebuf is ready to ship
+    if (eol_flag) linebuf.is_ready = true;
+
+    // consumed characters up to read_pos from raw_buf
+    return read_pos;
+}
+
+
+// FreeRTOS task looping UART from PC back to PC
+void bridge_usb_echo_task(void *arg)
+{
+    uint8_t uartbuf[BRIDGE_UART_BUFFER_SIZE];   // local read buffer, not the same as the UART's internal buffer
+    const char crlf[2] = {'\r', '\n'};
+    size_t n_read_from_uart = 0;                // number of chars read from uart
+    size_t n_rem_in_buffer = 0;                 // number of chars remaining to be processed in the local buffer
+    size_t n_consumed = 0;                      // number of chars consumed in creating current line
+
+    for (;;) {
+        if (!linebuf.is_ready) {
+            // Waiting for more chars or an eol before sending uart
+
+            if (n_rem_in_buffer == 0) {
+                // Local buffer fully processed
+                // Read more data from jtag-uart
+                n_read_from_uart = usb_serial_jtag_read_bytes(uartbuf, BRIDGE_UART_BUFFER_SIZE, 20 / portTICK_PERIOD_MS);
+
+                if (n_read_from_uart <= 0) {
+                    continue;                           // nothing recvd from uart, try again
+                } else {
+                    // echo it back to the user
+                    usb_serial_jtag_write_bytes((char *)uartbuf, n_read_from_uart, 20 / portTICK_PERIOD_MS);
+                    n_rem_in_buffer = n_read_from_uart; // there is work to do
+                    continue;
+                }
+            } else {
+                // Now there is some remaining work to do, try to form a full line.
+                n_consumed = extract_line(&uartbuf[n_read_from_uart - n_rem_in_buffer], n_rem_in_buffer);
+                n_rem_in_buffer -= n_consumed;
+            }
+        }   // !linebuf.is_ready
+
+        if (linebuf.is_ready) {
+            // Commit
+            usb_serial_jtag_write_bytes(crlf, 2, 20 / portTICK_PERIOD_MS);
+
+            // Send to Modem
+            usb_serial_jtag_write_bytes((char *) linebuf.line, linebuf.write_pos, 20 / portTICK_PERIOD_MS);
+            usb_serial_jtag_write_bytes(crlf, 2, 20 / portTICK_PERIOD_MS);
+            reset_linebuf();
+        }
+
+    }
+}
+
+// FreeRTOS task transmitting bytes from PC to modem
+void bridge_pc_to_modem_task(void *arg);
+
+// FreeRTOS task transmitting bytes from modem to PC
+void bridge_modem_to_pc_task(void *arg);
+
