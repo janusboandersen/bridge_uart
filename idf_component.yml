@@ -1,0 +1,7 @@
+version: "0.1.0"
+description: "Bridge between UARTs or USB-JTAG."
+targets: [esp32s3]
+dependencies:
+  idf: ">=5.5"
+license: MIT
+repository: https://github.com/janusboandersen/bridge_uart
